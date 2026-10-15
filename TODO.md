@@ -1,0 +1,7 @@
+- [x] Corregir modelo de crecimiento y contrastarlo con ARM; validar GUI/CLI y filtros.
+- [x] Aplicar solo correcciones confirmadas de Faye/Esteban; conservar Excel y foto.
+- [x] Leer exportación Checkpoint con CRC válido; reconocer22jugadores, variante y entrenamiento actuales.
+- [x] Explicar desfase Dan por Aguante entrenado+5; retirar modificación de base e importar entrenamiento correctamente.
+- [x] Probar importación real GUI/CLI y19tests; empaquetar actualización.
+- [ ] Explicar condición de presentación/estado inicial de Sapp: foto válida, cuatro diferencias pendientes.
+- [ ] Alcanzar880/880 con corrección generalizable; sin excepción por jugador/nivel ni eliminación de referencias.
