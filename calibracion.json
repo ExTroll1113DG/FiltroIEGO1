@@ -2,9 +2,7 @@
   "modelo": "go-light-arm-v1",
   "bases": {},
   "entrenamiento": {
-    "c970474d85a0a3f757ec41bff454ec869bdb80cb36f0ce23d83380acbdf9f99c": {
-      "Aguante": 5
-    }
+    
   },
   "partida_sha256": "bda56bc8b745bd11076164d2b9ff650f2648b5b6e8a166731424717ece5b7f3d"
 }
