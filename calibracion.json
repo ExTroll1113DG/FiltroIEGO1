@@ -1,8 +1,5 @@
 {
   "modelo": "go-light-arm-v1",
   "bases": {},
-  "entrenamiento": {
-    
-  },
-  "partida_sha256": "bda56bc8b745bd11076164d2b9ff650f2648b5b6e8a166731424717ece5b7f3d"
+  "entrenamiento": {}
 }
