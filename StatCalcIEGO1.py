@@ -201,14 +201,18 @@ def cargar_bd(ruta):
     P = [v for n, v in cfgbin(a.leer("chara_param.cfg.bin")) if n == "CHARA_PARAM_INFO"]
     B = {v[0]: v for n, v in cfgbin(a.leer("chara_base.cfg.bin")) if n == "CHARA_BASE_INFO"}
     nombres = {v[0]: v[5] for n, v in cfgbin(a.leer("chara_text_es.cfg.bin")) if n == "NOUN_INFO"}
-    # Permanent passives: read to validate references without confusing
-    # learned skills with natural growth. Calculated stats still exclude bonuses.
-    pasivas = {}
+    # Resolve permanent stat passives globally, including manually taught moves.
+    # The save's learned flags, not level guesses, determine active passives.
+    pasivas = {}; bonus_habilidades = {}; habilidades_disponibles = False
     try:
         habilidades = {v[0]: v for n, v in cfgbin(a.leer("skill_config.cfg.bin"))
                        if n == "SKILL_CONFIG_INFO"}
         tipo_stat = {1: "Control", 2: "Defensa", 3: "Regate", 4: "Tiro", 5: "Rapidez",
                      6: "Suerte", 7: "Tecnica", 8: "Aguante", 9: "PT", 10: "PE"}
+        habilidades_disponibles = True
+        for ident, h in habilidades.items():
+            if h[6] == 15 and h[9] == 1 and h[3] in tipo_stat:
+                bonus_habilidades[ident] = {"stat": tipo_stat[h[3]], "bonus": h[19]}
         for n, v in cfgbin(a.leer("skill_table.cfg.bin")):
             if n != "SKILL_TABLE": continue
             h = habilidades.get(v[2])
@@ -226,6 +230,8 @@ def cargar_bd(ruta):
                    "elemento": ELEMENTOS.get(r[COL_ELEMENTO], "?"),
                    "elemento_id": r[COL_ELEMENTO], "perfil": r[COL_PERFIL], "param_id": r[0],
                    "clave": hashlib.sha256(json.dumps(r, ensure_ascii=False).encode()).hexdigest(),
+                   "bonus_habilidades": bonus_habilidades,
+                   "habilidades_disponibles": habilidades_disponibles,
                    "pasivas": [pasivas[i] for i in range(r[18], r[18] + r[17]) if i in pasivas],
                    "base": {s: r[COL_STAT[s]] for s in STATS},
                    "curva": {s: r[COL_CURVA[s]] for s in STATS}})
@@ -346,20 +352,25 @@ def leer_partida(ruta):
     raw = Path(ruta).read_bytes()
     datos = _descifrar_partida(raw)
     inicio = 0x3438 if struct.unpack_from("<H", datos, 4)[0] == 0x6cf1 else 0x3488
-    if len(datos) < inicio + 112 * 204:
-        raise ValueError('Incomplete player table')
+    indice_inicio = 0x8e78 if inicio == 0x3438 else 0x8ec8
+    if len(datos) < indice_inicio + 112 * 4 + 8:
+        raise ValueError('Incomplete player table or roster index')
+    indices_fichados = set(struct.unpack_from("<112I", datos, indice_inicio)) - {0}
     jugadores = []
     for slot in range(112):
         off = inicio + slot * 204
         indice, ident, experiencia = struct.unpack_from("<IiI", datos, off)
-        if not ident: continue
+        if not ident or indice not in indices_fichados: continue
         nivel = datos[off + 18]
         if not NIVEL_MIN <= nivel <= NIVEL_MAX:
             raise ValueError('Invalid save record in slot %d' % slot)
         jugadores.append({"indice": indice, "param_id": ident, "nivel": nivel,
             "experiencia": experiencia,
             "entrenamiento": dict(zip(STATS[2:], struct.unpack_from("<8h", datos, off + 32))),
-            "equipo_indices": list(struct.unpack_from("<4I", datos, off + 56))})
+            "equipo_indices": list(struct.unpack_from("<4I", datos, off + 56)),
+            "habilidades": [{"id": struct.unpack_from("<i", datos, off + 76 + i * 12)[0],
+                             "aprendida": struct.unpack_from("<I", datos, off + 82 + i * 12)[0] != 0}
+                            for i in range(6)]})
     return jugadores, hashlib.sha256(raw).hexdigest()
 
 def importar_entrenamiento(bd, ruta, rates=None):
@@ -367,11 +378,14 @@ def importar_entrenamiento(bd, ruta, rates=None):
     resultado = dict(rates or {"modelo": MODELO, "bases": {}})
     resultado["bases"] = dict(resultado.get("bases", {}))
     resultado["entrenamiento"] = dict(resultado.get("entrenamiento", {}))
+    resultado["jugadores_partida"] = {}
+    resultado["pasivas_partida"] = {}
     por_id = {}
     for registro in registros:
         ident = registro["param_id"]
-        if ident in por_id and registro["entrenamiento"] != por_id[ident]["entrenamiento"]:
-            raise ValueError('The save contains multiple copies with different training for ID %s' % ident)
+        if ident in por_id and (registro["entrenamiento"], registro["habilidades"]) != (
+                por_id[ident]["entrenamiento"], por_id[ident]["habilidades"]):
+            raise ValueError('The save contains multiple copies with different training or skills for ID %s' % ident)
         por_id[ident] = registro
     vistos = set(); equipo = []
     for personaje in bd:
@@ -381,6 +395,19 @@ def importar_entrenamiento(bd, ruta, rates=None):
         if ident in vistos: raise ValueError('Duplicate player ID in the game data')
         vistos.add(ident)
         registro = por_id[ident]; clave = personaje["clave"]
+        if not personaje.get("habilidades_disponibles", True):
+            raise ValueError("Skill configuration is missing from game data; cannot resolve save passives.")
+        resultado["jugadores_partida"][clave] = {
+            "param_id": ident, "nivel": registro["nivel"],
+            "habilidades": registro["habilidades"]}
+        bonus_pasivas = {}
+        for habilidad in registro["habilidades"]:
+            if not habilidad["id"] or not habilidad["aprendida"]: continue
+            efecto = personaje.get("bonus_habilidades", {}).get(habilidad["id"])
+            if efecto:
+                stat = efecto["stat"]
+                bonus_pasivas[stat] = bonus_pasivas.get(stat, 0) + efecto["bonus"]
+        if bonus_pasivas: resultado["pasivas_partida"][clave] = bonus_pasivas
         # When changing the state source, remove these player base corrections:
         # avoid double-counting training previously mistaken for a base value.
         resultado["bases"].pop(clave, None)
@@ -389,7 +416,10 @@ def importar_entrenamiento(bd, ruta, rates=None):
         else: resultado["entrenamiento"].pop(clave, None)
         if any(registro["equipo_indices"]): equipo.append(personaje["nombre"])
     resultado["partida_sha256"] = huella
-    return resultado, {"encontrados": len(vistos), "con_equipo": equipo}
+    if not vistos:
+        raise ValueError("No recruited players match the loaded game data.")
+    return resultado, {"encontrados": len(vistos), "con_equipo": equipo,
+                       "sin_encontrar": sorted(set(por_id) - vistos)}
 
 
 def _guardar_calibracion(datos):
@@ -398,7 +428,7 @@ def _guardar_calibracion(datos):
     temporal.replace(FICHERO_CALIB)
 
 def crear_json_base(rates=None):
-    """Create clean settings, retaining only the currently imported save training.
+    """Create clean settings, retaining the currently imported save state.
 
     Base-stat corrections are always empty. The caller passes a save snapshot
     only if a save has been imported in the current session.
@@ -408,6 +438,9 @@ def crear_json_base(rates=None):
         resultado["entrenamiento"] = {
             clave: dict(bonus) for clave, bonus in rates.get("entrenamiento", {}).items()
         }
+        for campo in ("jugadores_partida", "pasivas_partida"):
+            if campo in rates:
+                resultado[campo] = json.loads(json.dumps(rates[campo]))
         if "partida_sha256" in rates:
             resultado["partida_sha256"] = rates["partida_sha256"]
     return resultado
@@ -420,11 +453,13 @@ def _sumar_entrenamiento(valor, bonus):
 def stats_nivel(p, nivel, rates=None):
     ajustes = (rates or {}).get("bases", {}).get(p.get("clave"), {})
     entrenamiento = (rates or {}).get("entrenamiento", {}).get(p.get("clave"), {})
+    pasivas = (rates or {}).get("pasivas_partida", {}).get(p.get("clave"), {})
     elemento = p.get("elemento_id")
     if elemento is None:
         elemento = next((k for k, v in ELEMENTOS.items() if v == p["elemento"]), 0)
     return {s: _sumar_entrenamiento(stat_juego(ajustes.get(s, p["base"][s]), p["curva"][s], nivel, i,
-                          elemento, p["perfil"]), entrenamiento.get(s, 0)) for i, s in enumerate(STATS)}
+                          elemento, p["perfil"]), entrenamiento.get(s, 0) + pasivas.get(s, 0))
+            for i, s in enumerate(STATS)}
 
 def _fmt(v):
     try:
@@ -495,7 +530,13 @@ def leer_ejemplos(ruta):
     return filas
 
 def contrastar_referencias(bd, filas, rates=None):
-    'Infer only bases consistent with ALL observations for a stat.\n\n    Never change curves, profiles or formulas. Deduct a passive only when\n    the residual changes by exactly 10/20 across 1 or 2 levels, or when\n    skill_table confirms a skill learned within that interval.\n    Keep contradictions in the report; never average or interpolate them.\n    '
+    """Infer only bases consistent with ALL observed values for a stat.
+
+    Never change curves, profiles or formulas. Compare reference values as
+    supplied, applying only training explicitly imported into the settings.
+    Do not infer or deduct passive/training bonuses from level-to-level jumps.
+    Keep contradictions in the report; never average or interpolate them.
+    """
     from collections import defaultdict
     grupos = defaultdict(list)
     for nombre, nivel, valores in filas:
@@ -520,23 +561,9 @@ def contrastar_referencias(bd, filas, rates=None):
         for i, stat in enumerate(STATS):
             base_original = p["base"][stat]
             def calcular(base, nivel):
-                return _sumar_entrenamiento(stat_juego(base, p["curva"][stat], nivel, i, p["elemento_id"], p["perfil"]), (rates or {}).get("entrenamiento", {}).get(p["clave"], {}).get(stat, 0))
-            serie = sorted((nivel, valores[i]) for nivel, valores in obs)
-            normalizados = []; bonus = 0; anterior = None
-            for nivel, valor in serie:
-                residuo = valor - calcular(base_original, nivel)
-                if anterior is not None:
-                    nivel_ant, residuo_ant = anterior
-                    salto = residuo - residuo_ant
-                    acreditado = sum(h["bonus"] for h in p.get("pasivas", [])
-                                      if h["stat"] == stat and nivel_ant < h["nivel"] <= nivel)
-                    if salto in (10, 20) and (1 <= nivel - nivel_ant <= 2 or acreditado == salto):
-                        bonus += salto
-                        informe["pasivas"].append({"nombre": p["nombre"], "stat": stat,
-                            "desde": nivel_ant, "hasta": nivel, "bonus": salto,
-                            "fuente": "skill_table" if acreditado == salto else "salto_corto"})
-                normalizados.append((nivel, valor - bonus))
-                anterior = (nivel, residuo)
+                return _sumar_entrenamiento(stat_juego(base, p["curva"][stat], nivel, i, p["elemento_id"], p["perfil"]), (rates or {}).get("entrenamiento", {}).get(p["clave"], {}).get(stat, 0)
+                        + (rates or {}).get("pasivas_partida", {}).get(p["clave"], {}).get(stat, 0))
+            normalizados = sorted((nivel, valores[i]) for nivel, valores in obs)
             candidatos = [base for base in range(256)
                           if all(calcular(base, n) == v for n, v in normalizados)]
             informe["valores"] += len(normalizados)
@@ -577,8 +604,6 @@ def calibrar(bd, ruta, rates, log=print):
         (len(filas), informe["coincidencias"], informe["valores"], len(informe["incompatibles"])))
     if informe["sin_encontrar"]: log('Not found: ' + ", ".join(informe["sin_encontrar"]))
     if informe["ambiguos"]: log('Ambiguous names (unchanged): ' + ", ".join(informe["ambiguos"]))
-    for pasiva in informe["pasivas"]:
-        log('Passive deducted: %(nombre)s %(stat)s +%(bonus)d between levels %(desde)d and %(hasta)d' % dict(pasiva, stat=STAT_LABELS.get(pasiva['stat'], pasiva['stat'])))
     for error in informe["incompatibles"]:
         log('No compatible adjustment: %(nombre)s / %(stat)s; see contraste_referencias.json' % dict(error, stat=STAT_LABELS.get(error['stat'], error['stat'])))
     log('Consistent bases saved to %s; game formula preserved.' % FICHERO_CALIB)
@@ -639,6 +664,12 @@ def opcion_ranking(bd, rates):
     for i, (sc, p, s) in enumerate(filas[:top], 1):
         print("%3d. %-28s %6.1f   %s" % (i, p["nombre"], sc, " ".join("%s:%d" % (STAT_LABELS[k], s[k]) for k in pesos)))
 
+def jugadores_de_partida(bd, rates):
+    """Return only recruited players matched to this imported save snapshot."""
+    claves = (rates or {}).get("jugadores_partida", {})
+    return [p for p in bd if p["clave"] in claves]
+
+
 def calcular_ranking(grupo, pos, nivel, rates):
     'Return [(score, player, stats)] sorted from best to worst.'
     pesos = POSICIONES[pos]; filas = []
@@ -653,12 +684,12 @@ def main_cli():
     bd = cargar_bd(ruta); rates = cargar_rates(); partida_rates = None
     print('%d players loaded.' % len(bd))
     while True:
-        print('\n1) Player stats at a level          2) Ranking by position\n3) Change game data                 4) Calibrate with reference table\n5) Exit                             6) Import training from save\n7) Create base JSON')
+        print('\n1) Player stats at a level          2) Ranking by position\n3) Change game data                 4) Calibrate with reference table\n5) Exit                             6) Import training from save\n7) Create base JSON\n8) Ranking with imported save')
         o = input("> ").strip()
         if o == "1": opcion_consulta(bd, rates)
-        elif o == "2": opcion_ranking(bd, rates)
+        elif o == "2": opcion_ranking(bd, {})
         elif o == "3":
-            bd = cargar_bd(input('Path: ')); print('%d players loaded.' % len(bd))
+            bd = cargar_bd(input('Path: ')); partida_rates = None; print('%d players loaded.' % len(bd))
         elif o == "4":
             rates = calibrar(bd, input('Reference table path (.xlsx, .ods, .csv, .tsv or .txt): ').strip().strip('"'), rates)
         elif o == "6":
@@ -667,7 +698,7 @@ def main_cli():
                 _guardar_calibracion(nuevos)
                 rates = nuevos
                 partida_rates = crear_json_base(nuevos)
-                print('Training imported: %d players. Equipment and passives are excluded.' % informe["encontrados"])
+                print('Save imported: %d recruited players. Training and learned stat passives included; equipment excluded.' % informe["encontrados"])
             except (OSError, ValueError) as e:
                 print('Import failed: %s' % e)
         elif o == "7":
@@ -676,9 +707,14 @@ def main_cli():
                 _guardar_calibracion(nuevos)
                 rates = nuevos
                 print("JSON created at %s (%s)." % (FICHERO_CALIB,
-                    "imported save training" if partida_rates is not None else "no player changes"))
+                    "imported save roster, training and stat passives" if partida_rates is not None else "no player changes"))
             except OSError as e:
                 print("Could not create JSON: %s" % e)
+        elif o == "8":
+            if partida_rates is None:
+                print("Import game.ie4 first (option 6).")
+            else:
+                opcion_ranking(jugadores_de_partida(bd, partida_rates), partida_rates)
         elif o == "5": break
 
 # ----------------------------------------------------------------------------------
@@ -704,13 +740,14 @@ class App:
         ttk.Button(top, text='Browse...', command=self.examinar).pack(side="left")
         self.btn_cargar = ttk.Button(top, text='Load', command=self.cargar)
         self.btn_cargar.pack(side="left", padx=(6, 0))
-        ttk.Button(top, text='Import training...', command=self.importar_partida_gui).pack(side="left", padx=6)
+        ttk.Button(top, text='Import save...', command=self.importar_partida_gui).pack(side="left", padx=6)
         self.var_estado = tk.StringVar(value='Choose game data (.7z or ie_a.fa) and click Load.')
         ttk.Label(self.root, textvariable=self.var_estado, padding=(10, 0, 10, 6), foreground="#444").pack(fill="x")
 
         # --- tabs ---
         self.nb = ttk.Notebook(self.root); self.nb.pack(fill="both", expand=True, padx=8, pady=(0, 8))
-        self._tab_consulta(); self._tab_ranking(); self._tab_calibracion()
+        self.rank_tabs = {}
+        self._tab_consulta(); self._tab_ranking(); self._tab_ranking(True); self._tab_calibracion()
         if ruta_inicial:
             self.root.after(200, self.cargar)
 
@@ -742,6 +779,8 @@ class App:
             self.var_estado.set('Loading failed.')
             self.mb.showerror('Could not load file', str(val)); return
         self.bd = val
+        self.partida_rates = None
+        self._limpiar_rankings()
         self.etiquetas = {}
         for p in self.bd:
             et = p["nombre"]; k = 2
@@ -761,9 +800,12 @@ class App:
             _guardar_calibracion(nuevos)
             self.rates = nuevos
             self.partida_rates = crear_json_base(nuevos)
+            self._limpiar_rankings(True)
         except (OSError, ValueError) as e:
             self.mb.showerror('Import failed', str(e)); return
-        self.var_estado.set('Training imported: %d players. Equipment and passives are excluded.' % informe["encontrados"])
+        self.var_estado.set('Save imported: %d recruited players. Training and learned stat passives included; equipment excluded.' % informe["encontrados"])
+        if informe["sin_encontrar"]:
+            self.mb.showwarning("Unmatched players", "%d recruited player IDs do not match the loaded game data and were excluded." % len(informe["sin_encontrar"]))
         if informe["con_equipo"]:
             self.mb.showinfo('Equipment excluded', 'The save contains equipped players; equipment bonuses are not imported.')
 
@@ -825,81 +867,104 @@ class App:
         for k in STATS:
             self.tv_c.insert("", "end", values=(STAT_LABELS[k], iniciales[k], s[k], "%+d" % (s[k] - iniciales[k])))
 
-    # ----- tab 2: ranking -----
-    def _tab_ranking(self):
+    # ----- tabs 2 and 3: natural/save rankings -----
+    def _tab_ranking(self, con_partida=False):
+        from types import SimpleNamespace
+        r = SimpleNamespace()
+        self.rank_tabs[con_partida] = r
         tk, ttk = self.tk, self.ttk
-        f = ttk.Frame(self.nb, padding=10); self.nb.add(f, text='Ranking by position')
+        f = ttk.Frame(self.nb, padding=10)
+        self.nb.add(f, text='Save ranking' if con_partida else 'Natural ranking')
+        help_text = ("Recruited players only. Includes save training and learned stat passives; equipment excluded."
+                     if con_partida else "Natural stats from game data only. Save training and JSON adjustments are ignored.")
+        ttk.Label(f, text=help_text, wraplength=900).pack(anchor="w", pady=(0, 6))
+        if con_partida:
+            ttk.Button(f, text="Import game.ie4...", command=self.importar_partida_gui).pack(anchor="w", pady=(0, 6))
         izq = ttk.Frame(f); izq.pack(side="left", fill="y", padx=(0, 12))
         ttk.Label(izq, text='Position:').pack(anchor="w")
-        self.var_pos = tk.StringVar(value=POSITION_LABELS[list(POSICIONES)[0]])
-        cb = ttk.Combobox(izq, textvariable=self.var_pos, values=list(POSITION_LABELS.values()), state="readonly", width=16)
-        cb.pack(anchor="w"); cb.bind("<<ComboboxSelected>>", lambda e: self._mostrar_pesos())
-        self.var_pesos = tk.StringVar(); ttk.Label(izq, textvariable=self.var_pesos, wraplength=170, foreground="#444").pack(anchor="w", pady=(2, 8))
+        r.var_pos = tk.StringVar(value=POSITION_LABELS[list(POSICIONES)[0]])
+        cb = ttk.Combobox(izq, textvariable=r.var_pos, values=list(POSITION_LABELS.values()), state="readonly", width=16)
+        cb.pack(anchor="w"); cb.bind("<<ComboboxSelected>>", lambda e: self._mostrar_pesos(con_partida))
+        r.var_pesos = tk.StringVar(); ttk.Label(izq, textvariable=r.var_pesos, wraplength=170, foreground="#444").pack(anchor="w", pady=(2, 8))
         ttk.Label(izq, text='Level:').pack(anchor="w")
-        self.var_niv_r = tk.IntVar(value=1)
-        ttk.Spinbox(izq, from_=NIVEL_MIN, to=NIVEL_MAX, textvariable=self.var_niv_r, width=6).pack(anchor="w", pady=(0, 8))
-        self.var_modo = tk.StringVar(value="todos")
-        ttk.Radiobutton(izq, text='Entire database', variable=self.var_modo, value="todos", command=self._modo).pack(anchor="w")
-        ttk.Radiobutton(izq, text='Only these names:', variable=self.var_modo, value="lista", command=self._modo).pack(anchor="w")
-        self.txt_nombres = tk.Text(izq, width=24, height=9, state="disabled"); self.txt_nombres.pack(anchor="w", pady=4)
+        r.var_niv_r = tk.IntVar(value=1)
+        ttk.Spinbox(izq, from_=NIVEL_MIN, to=NIVEL_MAX, textvariable=r.var_niv_r, width=6).pack(anchor="w", pady=(0, 8))
+        r.var_modo = tk.StringVar(value="todos")
+        ttk.Radiobutton(izq, text='Entire database', variable=r.var_modo, value="todos", command=lambda: self._modo(con_partida)).pack(anchor="w")
+        ttk.Radiobutton(izq, text='Only these names:', variable=r.var_modo, value="lista", command=lambda: self._modo(con_partida)).pack(anchor="w")
+        r.txt_nombres = tk.Text(izq, width=24, height=9, state="disabled"); r.txt_nombres.pack(anchor="w", pady=4)
         ttk.Label(izq, text='(one per line or comma-separated)', foreground="#666").pack(anchor="w")
         fila = ttk.Frame(izq); fila.pack(anchor="w", pady=(8, 0))
         ttk.Label(fila, text='Show top:').pack(side="left")
-        self.var_top = tk.IntVar(value=20)
-        self.sp_top = ttk.Spinbox(fila, from_=1, to=2000, textvariable=self.var_top, width=6); self.sp_top.pack(side="left", padx=4)
-        ttk.Button(izq, text='Calculate ranking', command=self.ranking).pack(anchor="w", pady=10)
+        r.var_top = tk.IntVar(value=20)
+        r.sp_top = ttk.Spinbox(fila, from_=1, to=2000, textvariable=r.var_top, width=6); r.sp_top.pack(side="left", padx=4)
+        ttk.Button(izq, text='Calculate ranking', command=lambda: self.ranking(con_partida)).pack(anchor="w", pady=10)
         der = ttk.Frame(f); der.pack(side="left", fill="both", expand=True)
         cols = ("n", "nombre", "punt", "elem") + tuple(STATS)
-        self.tv_r = ttk.Treeview(der, columns=cols, show="headings")
+        r.tv_r = ttk.Treeview(der, columns=cols, show="headings")
         anchos = {"n": 40, "nombre": 170, "punt": 70, "elem": 70}
         etiq = {"n": "#", "nombre": 'Name', "punt": 'Score', "elem": "Elem."}
         for c in cols:
-            self.tv_r.heading(c, text=etiq.get(c, STAT_LABELS.get(c, c))); self.tv_r.column(c, width=anchos.get(c, 62), anchor="center" if c != "nombre" else "w", stretch=(c == "nombre"))
-        sb = ttk.Scrollbar(der, orient="vertical", command=self.tv_r.yview); self.tv_r.configure(yscrollcommand=sb.set)
-        self.tv_r.pack(side="left", fill="both", expand=True); sb.pack(side="left", fill="y")
-        self._mostrar_pesos(); self._modo()
+            r.tv_r.heading(c, text=etiq.get(c, STAT_LABELS.get(c, c))); r.tv_r.column(c, width=anchos.get(c, 62), anchor="center" if c != "nombre" else "w", stretch=(c == "nombre"))
+        sb = ttk.Scrollbar(der, orient="vertical", command=r.tv_r.yview); r.tv_r.configure(yscrollcommand=sb.set)
+        r.tv_r.pack(side="left", fill="both", expand=True); sb.pack(side="left", fill="y")
+        self._mostrar_pesos(con_partida); self._modo(con_partida)
 
-    def _mostrar_pesos(self):
-        w = POSICIONES[next(k for k, v in POSITION_LABELS.items() if v == self.var_pos.get())]
-        self.var_pesos.set('Weights: ' + ", ".join("%s x%d" % (STAT_LABELS[k], v) for k, v in w.items()))
+    def _mostrar_pesos(self, con_partida=False):
+        r = self.rank_tabs[con_partida]
+        w = POSICIONES[next(k for k, v in POSITION_LABELS.items() if v == r.var_pos.get())]
+        r.var_pesos.set('Weights: ' + ", ".join("%s x%d" % (STAT_LABELS[k], v) for k, v in w.items()))
 
-    def _modo(self):
-        lista = self.var_modo.get() == "lista"
-        self.txt_nombres.config(state="normal" if lista else "disabled")
-        self.sp_top.config(state="disabled" if lista else "normal")
+    def _modo(self, con_partida=False):
+        r = self.rank_tabs[con_partida]
+        lista = r.var_modo.get() == "lista"
+        r.txt_nombres.config(state="normal" if lista else "disabled")
+        r.sp_top.config(state="disabled" if lista else "normal")
 
-    def ranking(self):
+    def ranking(self, con_partida=False):
         if not self._requiere_datos(): return
-        try: n = int(self.var_niv_r.get())
+        r = self.rank_tabs[con_partida]
+        if con_partida and self.partida_rates is None:
+            self.mb.showinfo("No save loaded", "Import game.ie4 before calculating a save ranking.")
+            return
+        try: n = int(r.var_niv_r.get())
         except Exception: n = -1
         if not NIVEL_MIN <= n <= NIVEL_MAX:
             self.mb.showwarning('Invalid level', 'Level must be between %d and %d.' % (NIVEL_MIN, NIVEL_MAX)); return
-        pos = next(k for k, v in POSITION_LABELS.items() if v == self.var_pos.get()); faltan = []
-        if self.var_modo.get() == "lista":
-            texto = self.txt_nombres.get("1.0", "end").replace(",", "\n")
+        pos = next(k for k, v in POSITION_LABELS.items() if v == r.var_pos.get()); faltan = []
+        disponibles = jugadores_de_partida(self.bd, self.partida_rates) if con_partida else self.bd
+        if r.var_modo.get() == "lista":
+            texto = r.txt_nombres.get("1.0", "end").replace(",", "\n")
             nombres = [t.strip() for t in texto.split("\n") if t.strip()]
             if not nombres:
                 self.mb.showinfo('No names', 'Enter at least one name.'); return
             grupo = []
             for t in nombres:
-                res = buscar(self.bd, t)
+                res = buscar(disponibles, t)
                 if not res: faltan.append(t)
                 for p in res:
                     if p not in grupo: grupo.append(p)
             top = len(grupo)
         else:
-            grupo = self.bd
-            try: top = int(self.var_top.get())
+            grupo = disponibles
+            try: top = int(r.var_top.get())
             except Exception: top = 20
-        filas = calcular_ranking(grupo, pos, n, self.rates)
-        self.tv_r.delete(*self.tv_r.get_children())
+        filas = calcular_ranking(grupo, pos, n, self.partida_rates if con_partida else {})
+        r.tv_r.delete(*r.tv_r.get_children())
         for i, (sc, p, s) in enumerate(filas[:top], 1):
-            self.tv_r.insert("", "end", values=(i, p["nombre"], "%.1f" % sc, ELEMENT_LABELS.get(p["elemento"], p["elemento"])) + tuple(s[k] for k in STATS))
-        self.var_estado.set('%s ranking, level %d: %d players shown.' % (POSITION_LABELS[pos], n, min(top, len(filas))))
+            r.tv_r.insert("", "end", values=(i, p["nombre"], "%.1f" % sc, ELEMENT_LABELS.get(p["elemento"], p["elemento"])) + tuple(s[k] for k in STATS))
+        self.var_estado.set('%s — %s, level %d: %d players shown.' % (
+            "Save ranking" if con_partida else "Natural ranking", POSITION_LABELS[pos], n, min(top, len(filas))))
         if faltan:
             self.mb.showinfo('Names not found', 'Not found:\n' + "\n".join(faltan))
 
-    # ----- tab 3: calibration -----
+    def _limpiar_rankings(self, solo_partida=False):
+        """Discard results when their game data or imported save changes."""
+        for con_partida, r in self.rank_tabs.items():
+            if not solo_partida or con_partida:
+                r.tv_r.delete(*r.tv_r.get_children())
+
+    # ----- tab 4: calibration -----
     def _tab_calibracion(self):
         tk, ttk = self.tk, self.ttk
         f = ttk.Frame(self.nb, padding=10); self.nb.add(f, text='Calibration')
@@ -907,12 +972,12 @@ class App:
             'Uses the game formula (curve, element and profile). Choose a reference table (.xlsx, .ods, .csv or .txt) with players and observed stats at different '
             'levels (columns: Name, Position, Level, FP, TP, Element, Kick, Dribbling, Technique, Block, Speed, Stamina, Catch, '
             'Luck). Only bases consistent with all observed levels are corrected; contradictions are reported. '
-            'Passive jumps of +10/+20 across 1 or 2 levels are deducted. Settings are saved to calibracion.json.')).pack(anchor="w")
+            'No automatic jump deductions. Imported saves provide training and learned stat passives. Equipment is excluded. Settings are saved to calibracion.json.')).pack(anchor="w")
         fila = ttk.Frame(f); fila.pack(anchor="w", pady=8)
         ttk.Button(fila, text='Choose table and calibrate...', command=self.calibrar_gui).pack(side="left")
         ttk.Button(fila, text='Reset to defaults', command=self.restablecer).pack(side="left", padx=8)
         ttk.Button(fila, text="Create base JSON", command=self.crear_json_gui).pack(side="left", padx=8)
-        ttk.Label(f, text="Create base JSON: no player changes unless a save was imported this session; then retain its training.",
+        ttk.Label(f, text="Create base JSON: no player changes unless a save was imported this session; then retain its roster, training and learned stat passives.",
                   wraplength=860).pack(anchor="w", pady=(0, 8))
         self.txt_log = tk.Text(f, height=16, state="disabled"); self.txt_log.pack(fill="both", expand=True)
 
@@ -934,7 +999,7 @@ class App:
         except OSError as e:
             self.mb.showerror("Could not create JSON", str(e)); return
         self.rates = nuevos
-        estado = "imported save training" if self.partida_rates is not None else "no player changes"
+        estado = "imported save roster, training and stat passives" if self.partida_rates is not None else "no player changes"
         self._log("JSON created at %s (%s)." % (FICHERO_CALIB, estado))
         self.var_estado.set("JSON created (%s)." % estado)
 
@@ -943,6 +1008,7 @@ class App:
             if FICHERO_CALIB.exists(): FICHERO_CALIB.unlink()
         except OSError: pass
         self.partida_rates = None
+        self._limpiar_rankings(True)
         self.rates = {"modelo": MODELO, "bases": {}}; self._log('Defaults restored.')
 
     def run(self):
